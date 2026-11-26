@@ -413,17 +413,55 @@ class DeepseekMLAForwardMixin:
             )
             k_nope = latent_cache[..., : self.kv_lora_rank]
 
+            # Sail/PPU fused dual Q/K RMSNorm + Q FP8 quant for small-batch decode:
+            # replaces q_a_layernorm + kv_a_layernorm + q_b_proj per-token FP8 quant
+            # with a single launch while preserving BF16 q_lora for the DSA indexer.
+            used_sail_dual_norm_quant = False
+            if (
+                _is_sail
+                and envs.SGLANG_OPT_SAIL_GLM_DECODE_MEGAKERNEL.get()
+                and forward_batch.forward_mode.is_decode_or_idle()
+                and not q_replicate_active
+                and not self._use_min_latency_q_b_gemm
+                and q.ndim == 2
+                and k_nope.ndim == 2
+                and 0 < q.shape[0] <= 64
+                and q.dtype == k_nope.dtype == torch.bfloat16
+                and q.stride(-1) == 1
+                and k_nope.stride(-1) == 1
+                and type(getattr(self.q_b_proj, "quant_method", None)).__name__
+                == "W8A8Fp8LinearMethod"
+                and getattr(self.q_b_proj, "input_scale", None) is None
+                and not torch.compiler.is_compiling()
+            ):
+                from sglang.srt.hardware_backend.ppu.sail_glm_decode_megakernel import (
+                    sail_dual_rmsnorm_fp8_quant,
+                )
+
+                q_bf16, k_nope, q_fp8, q_scale = sail_dual_rmsnorm_fp8_quant(
+                    q,
+                    k_nope,
+                    self.q_a_layernorm.weight,
+                    self.kv_a_layernorm.weight,
+                    self.q_a_layernorm.variance_epsilon,
+                    self.kv_a_layernorm.variance_epsilon,
+                )
+                q_lora = q_bf16
+                q = (q_fp8, q_scale, q_bf16.dtype)
+                used_sail_dual_norm_quant = True
+
             # overlap qk norm
-            if self.alt_stream is not None and get_is_capture_mode():
-                current_stream = torch.cuda.current_stream()
-                self.alt_stream.wait_stream(current_stream)
-                q = self.q_a_layernorm(q)
-                with torch.cuda.stream(self.alt_stream):
+            if not used_sail_dual_norm_quant:
+                if self.alt_stream is not None and get_is_capture_mode():
+                    current_stream = torch.cuda.current_stream()
+                    self.alt_stream.wait_stream(current_stream)
+                    q = self.q_a_layernorm(q)
+                    with torch.cuda.stream(self.alt_stream):
+                        k_nope = self.kv_a_layernorm(k_nope)
+                    current_stream.wait_stream(self.alt_stream)
+                else:
+                    q = self.q_a_layernorm(q)
                     k_nope = self.kv_a_layernorm(k_nope)
-                current_stream.wait_stream(self.alt_stream)
-            else:
-                q = self.q_a_layernorm(q)
-                k_nope = self.kv_a_layernorm(k_nope)
 
             # q_lora needed by indexer
             if self.use_dsa:
