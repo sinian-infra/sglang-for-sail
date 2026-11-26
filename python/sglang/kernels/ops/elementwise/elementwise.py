@@ -284,3 +284,241 @@ def fused_gate_sigmoid_mul_add(
         final_hidden_states,
         do_add=True,
     )
+
+
+def _get_fp8_quant_params():
+    from sglang.kernels.ops.quantization.fp8_kernel import (
+        fp8_dtype,
+        fp8_max,
+        fp8_min,
+    )
+
+    return fp8_dtype, fp8_max, fp8_min
+
+
+@triton.jit
+def _gdn_gated_rmsnorm_fp8_quant_2d_kernel(
+    x_ptr,
+    z_ptr,
+    weight_ptr,
+    out_fp8_ptr,
+    out_scale_ptr,
+    stride_x,
+    stride_z,
+    stride_out,
+    NUM_HEADS: tl.constexpr,
+    HEAD_DIM: tl.constexpr,
+    eps: tl.constexpr,
+    fp8_max: tl.constexpr,
+    fp8_min: tl.constexpr,
+    HEAD_COUNT_BLOCK: tl.constexpr,
+    HEAD_DIM_BLOCK: tl.constexpr,
+):
+    """Single-pass fused GDN per-head SiLU-gated RMSNorm + per-token FP8 quant.
+
+    Keeps the entire [NUM_HEADS, HEAD_DIM] token slice in registers and preserves
+    exact BF16/FP16 rounding before per-token absmax and E4M3 quantization,
+    avoiding any intermediate global-memory round-trip.
+    """
+    pid = tl.program_id(0).to(tl.int64)
+    h_offs = tl.arange(0, HEAD_COUNT_BLOCK)[:, None]
+    d_offs = tl.arange(0, HEAD_DIM_BLOCK)[None, :]
+    mask = (h_offs < NUM_HEADS) & (d_offs < HEAD_DIM)
+    elem_offs = h_offs * HEAD_DIM + d_offs
+
+    x = tl.load(x_ptr + pid * stride_x + elem_offs, mask=mask, other=0.0).to(
+        tl.float32
+    )
+    z = tl.load(z_ptr + pid * stride_z + elem_offs, mask=mask, other=0.0).to(
+        tl.float32
+    )
+    w = tl.load(weight_ptr + d_offs, mask=d_offs < HEAD_DIM, other=0.0).to(tl.float32)
+
+    var = tl.sum(x * x, axis=1)[:, None] / HEAD_DIM
+    rrms = tl.math.rsqrt(var + eps)
+    # Match unfused RMSNormGated output rounding prior to FP8 quantization.
+    y = (x * rrms * w * z * tl.sigmoid(z)).to(x_ptr.dtype.element_ty).to(tl.float32)
+    y = tl.where(mask, y, 0.0)
+
+    overall_max = tl.max(tl.abs(y))
+    scale = tl.maximum(overall_max, 1e-10) / fp8_max
+    scale_inv = 1.0 / scale
+
+    q = tl.clamp(y * scale_inv, fp8_min, fp8_max).to(out_fp8_ptr.dtype.element_ty)
+    tl.store(out_fp8_ptr + pid * stride_out + elem_offs, q, mask=mask)
+    tl.store(out_scale_ptr + pid, scale)
+
+
+@triton.jit
+def _gdn_gated_rmsnorm_fp8_quant_multipass_kernel(
+    x_ptr,
+    z_ptr,
+    weight_ptr,
+    x_norm_ptr,
+    out_fp8_ptr,
+    out_scale_ptr,
+    stride_x,
+    stride_z,
+    stride_x_norm,
+    NUM_HEADS: tl.constexpr,
+    HEAD_DIM: tl.constexpr,
+    VALUE_DIM: tl.constexpr,
+    eps: tl.constexpr,
+    fp8_max: tl.constexpr,
+    fp8_min: tl.constexpr,
+    HEAD_BLOCK: tl.constexpr,
+    QUANT_BLOCK: tl.constexpr,
+):
+    """Multi-pass fallback when [HEAD_COUNT_BLOCK, HEAD_DIM_BLOCK] exceeds register budget."""
+    pid = tl.program_id(0).to(tl.int64)
+    x_base = pid * stride_x
+    z_base = pid * stride_z
+    norm_base = pid * stride_x_norm
+
+    for h in range(NUM_HEADS):
+        col_offs = tl.arange(0, HEAD_BLOCK)
+        head_mask = col_offs < HEAD_DIM
+        elem_offs = h * HEAD_DIM + col_offs
+
+        x = tl.load(x_ptr + x_base + elem_offs, mask=head_mask, other=0.0).to(
+            tl.float32
+        )
+        z = tl.load(z_ptr + z_base + elem_offs, mask=head_mask, other=0.0).to(
+            tl.float32
+        )
+        w = tl.load(weight_ptr + col_offs, mask=head_mask, other=0.0).to(tl.float32)
+
+        var = tl.sum(x * x, axis=0) / HEAD_DIM
+        rrms = tl.math.rsqrt(var + eps)
+        y = x * rrms * w * z * tl.sigmoid(z)
+
+        tl.store(
+            x_norm_ptr + norm_base + elem_offs,
+            y.to(x_norm_ptr.dtype.element_ty),
+            mask=head_mask,
+        )
+
+    g_max = tl.zeros([QUANT_BLOCK], dtype=tl.float32)
+    for start in range(0, VALUE_DIM, QUANT_BLOCK):
+        offs = start + tl.arange(0, QUANT_BLOCK)
+        mask = offs < VALUE_DIM
+        vals = tl.load(x_norm_ptr + norm_base + offs, mask=mask, other=0.0).to(
+            tl.float32
+        )
+        g_max = tl.maximum(g_max, tl.where(mask, tl.abs(vals), 0.0))
+
+    overall_max = tl.max(g_max, axis=0)
+    scale = tl.maximum(overall_max, 1e-10) / fp8_max
+    scale_inv = 1.0 / scale
+
+    for start in range(0, VALUE_DIM, QUANT_BLOCK):
+        offs = start + tl.arange(0, QUANT_BLOCK)
+        mask = offs < VALUE_DIM
+        vals = tl.load(x_norm_ptr + norm_base + offs, mask=mask, other=0.0).to(
+            tl.float32
+        )
+        q = tl.clamp(vals * scale_inv, fp8_min, fp8_max).to(
+            out_fp8_ptr.dtype.element_ty
+        )
+        tl.store(out_fp8_ptr + norm_base + offs, q, mask=mask)
+
+    tl.store(out_scale_ptr + pid, scale)
+
+
+def gdn_gated_rmsnorm_fp8_quant(
+    x: torch.Tensor,
+    z: torch.Tensor,
+    weight: torch.Tensor,
+    num_heads: int,
+    head_dim: int,
+    eps: float,
+):
+    """Fused GDN per-head SiLU-gated RMSNorm + per-token dynamic FP8 quantization.
+
+    Args:
+        x: Contiguous 2D tensor of shape ``(T * num_heads, head_dim)``.
+        z: Contiguous 2D gate tensor of shape ``(T * num_heads, head_dim)``.
+        weight: 1D RMSNorm weight of shape ``(head_dim,)``.
+        num_heads: Local number of value heads per token.
+        head_dim: Head dimension.
+        eps: RMSNorm epsilon.
+
+    Returns:
+        ``(out_fp8, out_scale)`` where ``out_fp8`` has shape
+        ``(T, num_heads * head_dim)`` in FP8 and ``out_scale`` has shape
+        ``(T, 1)`` in FP32.
+    """
+    assert x.is_contiguous(), "x must be contiguous"
+    assert z.is_contiguous(), "z must be contiguous"
+    assert x.shape == z.shape, f"x shape {x.shape} != z shape {z.shape}"
+    assert x.ndim == 2 and x.shape[1] == head_dim
+    assert x.shape[0] % num_heads == 0
+
+    T = x.shape[0] // num_heads
+    value_dim = num_heads * head_dim
+    fp8_dtype, fp8_max, fp8_min = _get_fp8_quant_params()
+
+    out_fp8 = torch.empty((T, value_dim), dtype=fp8_dtype, device=x.device)
+    out_scale = torch.empty((T, 1), dtype=torch.float32, device=x.device)
+    if T == 0:
+        return (out_fp8, out_scale)
+
+    head_count_block = triton.next_power_of_2(num_heads)
+    head_dim_block = triton.next_power_of_2(head_dim)
+    max_warps = 16 if _is_hip else 16
+
+    if head_count_block * head_dim_block <= 8192:
+        num_warps = max(
+            min(
+                triton.next_power_of_2(
+                    triton.cdiv(head_count_block * head_dim_block, 256)
+                ),
+                max_warps,
+            ),
+            4,
+        )
+        _gdn_gated_rmsnorm_fp8_quant_2d_kernel[(T,)](
+            x,
+            z,
+            weight,
+            out_fp8,
+            out_scale,
+            stride_x=value_dim,
+            stride_z=value_dim,
+            stride_out=out_fp8.stride(0),
+            NUM_HEADS=num_heads,
+            HEAD_DIM=head_dim,
+            eps=eps,
+            fp8_max=fp8_max,
+            fp8_min=fp8_min,
+            HEAD_COUNT_BLOCK=head_count_block,
+            HEAD_DIM_BLOCK=head_dim_block,
+            num_warps=num_warps,
+        )
+    else:
+        x_norm = torch.empty((T, value_dim), dtype=x.dtype, device=x.device)
+        quant_block = min(triton.next_power_of_2(value_dim), 4096)
+        num_warps = max(
+            min(triton.next_power_of_2(triton.cdiv(quant_block, 256)), max_warps), 4
+        )
+        _gdn_gated_rmsnorm_fp8_quant_multipass_kernel[(T,)](
+            x,
+            z,
+            weight,
+            x_norm,
+            out_fp8,
+            out_scale,
+            stride_x=value_dim,
+            stride_z=value_dim,
+            stride_x_norm=x_norm.stride(0),
+            NUM_HEADS=num_heads,
+            HEAD_DIM=head_dim,
+            VALUE_DIM=value_dim,
+            eps=eps,
+            fp8_max=fp8_max,
+            fp8_min=fp8_min,
+            HEAD_BLOCK=head_dim_block,
+            QUANT_BLOCK=quant_block,
+            num_warps=num_warps,
+        )
+    return (out_fp8, out_scale)

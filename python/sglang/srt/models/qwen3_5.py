@@ -31,7 +31,10 @@ from sglang.kernels.ops.attention.triton_gdn_fused_proj import (
     fused_qkvzba_split_reshape_cat_contiguous,
     qwen3_5_gdn_prefill_projection_views,
 )
-from sglang.kernels.ops.elementwise.elementwise import fused_sigmoid_mul
+from sglang.kernels.ops.elementwise.elementwise import (
+    fused_sigmoid_mul,
+    gdn_gated_rmsnorm_fp8_quant,
+)
 
 # Configs
 from sglang.srt.configs.model_config import (
@@ -99,6 +102,7 @@ from sglang.srt.layers.quantization.unquant import (
     UnquantizedLinearMethod,
     bf16_gemm_dispatch,
 )
+from sglang.srt.layers.quantization.w8a8_fp8 import W8A8Fp8LinearMethod
 from sglang.srt.layers.radix_attention import AttentionType, RadixAttention
 from sglang.srt.layers.radix_linear_attention import RadixLinearAttention
 from sglang.srt.layers.rotary_embedding import get_rope
@@ -149,6 +153,7 @@ from sglang.srt.utils import (
     is_gfx95_supported,
     is_hip,
     is_npu,
+    is_sail,
     is_xpu,
     make_pp_layers,
     set_weight_attrs,
@@ -162,6 +167,10 @@ _is_npu = is_npu()
 _is_cpu = is_cpu()
 _is_gfx95 = is_gfx95_supported()
 _is_hip = is_hip()
+_is_sail = is_sail()
+_gdn_fused_rmsnorm_fp8_quant = _is_sail and get_bool_env_var(
+    "SGLANG_GDN_FUSED_RMSNORM_FP8_QUANT", "true"
+)
 _QWEN3_5_MOE_TEXT_MODEL_TYPES = ("qwen3_5_moe_text", "qwen4_exp_text")
 # qwen4_exp shares these classes, but the ROCm packed path is Qwen3.5-only.
 _QWEN3_5_ROCM_PACKED_MODEL_TYPES = ("qwen3_5_text", "qwen3_5_moe_text")
@@ -1107,6 +1116,29 @@ class Qwen3_5GatedDeltaNet(nn.Module):
                 quant_heads=nv,
             )
             return self.out_proj(fp8)[0]
+
+        if (
+            _gdn_fused_rmsnorm_fp8_quant
+            and not use_strided_prefill_z
+            and self.norm.activation in ("swish", "silu")
+            and 0 < core_attn_out.shape[0] <= 4096 * nv
+            and core_attn_out.is_contiguous()
+            and z.is_contiguous()
+            and type(getattr(self.out_proj, "quant_method", None))
+            is W8A8Fp8LinearMethod
+            and getattr(self.out_proj, "input_scale", None) is None
+            and not torch.compiler.is_compiling()
+            and not get_forward().sp_active
+        ):
+            out_fp8, out_scale = gdn_gated_rmsnorm_fp8_quant(
+                core_attn_out,
+                z,
+                self.norm.weight,
+                num_heads=nv,
+                head_dim=self.head_v_dim,
+                eps=self.norm.eps,
+            )
+            return self.out_proj((out_fp8, out_scale, core_attn_out.dtype))[0]
 
         core_attn_out = self.norm(core_attn_out, z)
         core_attn_out = core_attn_out.reshape(z_shape_og)
