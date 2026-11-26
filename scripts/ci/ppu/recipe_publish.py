@@ -108,13 +108,22 @@ def validate(payload):
         "recipe_tree_sha256",
     }
     tier = payload.get("tier")
-    tier_fields = {"fast_sanity": FAST, "model_sanity": NIGHTLY}.get(tier)
+    tier_fields = {
+        "fast_sanity": FAST,
+        "model_sanity": NIGHTLY,
+        "light_perf": {"case_status"},
+        "unit_test": set(),
+    }.get(tier)
     if tier_fields is None or set(payload) - (meta | BASE | tier_fields):
         raise ValueError("unexpected result field")
     if (
         payload["schema"] != "ppu-sanity/v1"
         or not re.fullmatch(r"[a-z0-9][a-z0-9.-]*", payload["model"])
-        or not (MODEL_POLICY_ROOT / f"{payload['model']}.yaml").is_file()
+        or not (
+            payload["model"] in {"ppu-unit-0", "ppu-unit-1"}
+            if tier == "unit_test"
+            else (MODEL_POLICY_ROOT / f"{payload['model']}.yaml").is_file()
+        )
         or payload["route"] not in ALLOWED_ROUTES
         or not re.fullmatch(r"[0-9a-f]{40}", payload["source_sha"])
         or payload["outcome"] not in {"pass", "fail"}
@@ -185,7 +194,32 @@ def validate(payload):
         or not 0 <= payload["gsm8k_correct"] <= 1319
     ):
         raise ValueError("invalid correct count")
-    if payload["outcome"] == "pass":
+    if tier == "light_perf" and "case_status" in payload:
+        cases = payload["case_status"]
+        if not isinstance(cases, dict) or not cases or any(
+            not re.fullmatch(r"[a-z0-9][a-z0-9_-]{0,127}", name)
+            or type(passed) is not bool
+            for name, passed in cases.items()
+        ):
+            raise ValueError("invalid light performance evidence")
+    if payload["outcome"] == "pass" and tier in {"light_perf", "unit_test"}:
+        required = (meta - {"failure_phase", "runtime_versions"}) | {
+            "queue_s", "outcome"
+        }
+        if tier == "light_perf":
+            required.add("case_status")
+        if (
+            not required <= payload.keys()
+            or "failure_phase" in payload
+            or not payload["private_retention"]
+            or (tier == "light_perf" and not all(payload["case_status"].values()))
+            or (
+                payload["route"] == "prebuilt-image"
+                and "sglang" not in payload.get("runtime_versions", {})
+            )
+        ):
+            raise ValueError(f"passing {tier} result lacks evidence")
+    elif payload["outcome"] == "pass":
         required = (
             (meta - {"failure_phase", "runtime_versions"})
             | BASE
@@ -242,6 +276,10 @@ def publish(payload, artifact, summary, console):
             if payload["schema"] == LEGACY_SCHEMA
             else "PPU Recipe Sanity"
         )
+        if payload.get("tier") == "light_perf":
+            title = "PPU Light Performance"
+        elif payload.get("tier") == "unit_test":
+            title = "PPU Unit Tests"
         output.write(f"## {title}\n\n```json\n" + canonical + "\n```\n")
     print(canonical, file=console)
 

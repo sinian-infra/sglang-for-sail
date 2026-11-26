@@ -64,6 +64,10 @@ def main():
             if runner_summary.stat().st_size > 8192:
                 raise ValueError("unexpected result size")
             result = json.loads(runner_summary.read_text())
+    if env["TIER"] == "light_perf" and "cases" in result:
+        result["case_status"] = {
+            name: case["passed"] for name, case in result.pop("cases").items()
+        }
     if outcome == "success" and result.get("outcome") != "pass":
         outcome = "failure"
     if outcome != "success" or not retained:
