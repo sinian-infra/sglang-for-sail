@@ -2342,6 +2342,9 @@ class Envs:
     SGLANG_DSA_USE_DSV4_BF16_TOPK = EnvBool(True)
     # Enable NaN check on logits valid range before topk_transform (debug/diag).
     SGLANG_BF16_TOPK_DEBUG = EnvBool(False)
+    # Sail/PPU GLM-5.3 small-batch decode megakernels (fused dual Q/K RMSNorm +
+    # FP8 quant and fused MoE router + shared-expert FP8 quant).
+    SGLANG_OPT_SAIL_GLM_DECODE_MEGAKERNEL = EnvBool(True)
 
 
 envs = Envs()
