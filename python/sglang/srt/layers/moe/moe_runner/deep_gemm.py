@@ -325,6 +325,9 @@ class DeepGemmMoeQuantInfo(MoeQuantInfo):
     use_mxfp4_w4a8: bool = False
     w13_inv_scale: float = 1.0
     w2_inv_scale: float = 1.0
+    # True when w13 weights/scales were interleaved by
+    # preprocess_mxfp4_weight_for_act_and_quant_fusing for fused SiLU+MXFP4 epilogue.
+    w13_epilogue_fused: bool = False
 
     def __post_init__(self):
         if self.use_mxfp8:
@@ -1305,62 +1308,93 @@ class DeepGemmRunnerCore(MoeRunnerCore):
         b13 = quant_info.b13
         b2 = quant_info.b2
 
-        gateup_output = torch.empty(
-            (all_tokens, N),
-            device=hidden_states_device,
-            dtype=torch.bfloat16,
+        fuse_epilogue = (
+            quant_info.w13_epilogue_fused
+            and self.config.activation == "silu"
+            and self.config.gemm1_alpha is None
+            and b13 is None
         )
         # [WA] before deepep normal mode support uint16_t column major scale
         hidden_states_scale = preprocess_mxfp4_scales(hidden_states_scale)
-        deep_gemm_wrapper.grouped_gemm_nt_f4f4bf16_nopad(
-            (hidden_states, hidden_states_scale),
-            w13_weight_quant,
-            b13,
-            gateup_output,
-            m_indices,
-            m_rows,
-        )
-
-        dispose_tensor(hidden_states)
-        dispose_tensor(hidden_states_scale)
-
-        if self.config.activation == "situ":
+        if fuse_epilogue:
+            assert N % 128 == 0, f"fused FP4 epilogue requires n % 128 == 0, got {N}"
             down_input_fp4 = torch.empty(
                 (all_tokens, N // 4),
-                device=gateup_output.device,
+                device=hidden_states_device,
                 dtype=torch.uint8,
             )
             down_input_scale = torch.empty(
-                (N // 128, all_tokens),
-                device=gateup_output.device,
+                (all_tokens, ceil_div(N // 4, 32)),
+                device=hidden_states_device,
                 dtype=torch.uint16,
             )
-            self._apply_situ_and_mul(
-                gateup_output,
+            deep_gemm_wrapper.grouped_gemm_nt_f4f4bf16_nopad(
+                (hidden_states, hidden_states_scale),
+                w13_weight_quant,
+                b13,
                 down_input_fp4,
-                down_input_scale=down_input_scale,
+                m_indices,
+                m_rows,
+                out_scale=down_input_scale,
+                swiglu_limit=self.swiglu_limit,
             )
-            down_input_scale = down_input_scale.t()
-        elif self.config.gemm1_alpha is not None:
-            # gpt-oss: the fused silu+mul+mxfp4 kernel has no alpha/clamp-limit
-            # variant, so run the activation separately and then quantize.
-            # downcast_to_mxfp4 emits the same preprocessed scale layout (uint16
-            # packed, transposed-contiguous) as the fused kernel, which is what
-            # grouped_gemm_nt_f4f4bf16_nopad expects.
-            down_input = _apply_oai_swiglu(
+            dispose_tensor(hidden_states)
+            dispose_tensor(hidden_states_scale)
+        else:
+            gateup_output = torch.empty(
+                (all_tokens, N),
+                device=hidden_states_device,
+                dtype=torch.bfloat16,
+            )
+            deep_gemm_wrapper.grouped_gemm_nt_f4f4bf16_nopad(
+                (hidden_states, hidden_states_scale),
+                w13_weight_quant,
+                b13,
                 gateup_output,
-                gemm1_alpha=self.config.gemm1_alpha,
-                gemm1_clamp_limit=self.config.gemm1_clamp_limit,
-                gate_up_interleaved=self.config.gate_up_interleaved,
+                m_indices,
+                m_rows,
             )
 
-            down_input_fp4, down_input_scale = downcast_to_mxfp4(down_input, axis=1)
-            del down_input
-        else:
-            down_input_fp4, down_input_scale = silu_and_mul_post_quant_mxfp4(
-                gateup_output, swiglu_limit=self.swiglu_limit
-            )
-        del gateup_output
+            dispose_tensor(hidden_states)
+            dispose_tensor(hidden_states_scale)
+
+            if self.config.activation == "situ":
+                down_input_fp4 = torch.empty(
+                    (all_tokens, N // 4),
+                    device=gateup_output.device,
+                    dtype=torch.uint8,
+                )
+                down_input_scale = torch.empty(
+                    (N // 128, all_tokens),
+                    device=gateup_output.device,
+                    dtype=torch.uint16,
+                )
+                self._apply_situ_and_mul(
+                    gateup_output,
+                    down_input_fp4,
+                    down_input_scale=down_input_scale,
+                )
+                down_input_scale = down_input_scale.t()
+            elif self.config.gemm1_alpha is not None:
+                # gpt-oss: the fused silu+mul+mxfp4 kernel has no alpha/clamp-limit
+                # variant, so run the activation separately and then quantize.
+                # downcast_to_mxfp4 emits the same preprocessed scale layout (uint16
+                # packed, transposed-contiguous) as the fused kernel, which is what
+                # grouped_gemm_nt_f4f4bf16_nopad expects.
+                down_input = _apply_oai_swiglu(
+                    gateup_output,
+                    gemm1_alpha=self.config.gemm1_alpha,
+                    gemm1_clamp_limit=self.config.gemm1_clamp_limit,
+                    gate_up_interleaved=self.config.gate_up_interleaved,
+                )
+
+                down_input_fp4, down_input_scale = downcast_to_mxfp4(down_input, axis=1)
+                del down_input
+            else:
+                down_input_fp4, down_input_scale = silu_and_mul_post_quant_mxfp4(
+                    gateup_output, swiglu_limit=self.swiglu_limit
+                )
+            del gateup_output
 
         down_output = torch.empty(
             (all_tokens, K * 2),
@@ -2097,52 +2131,84 @@ class DeepGemmRunnerCore(MoeRunnerCore):
         # GroupGemm-0
         num_groups, m, k = hidden_states.shape
         n = w13_weight.size(1)
-        gateup_output = torch.empty(
-            (num_groups, m, n), device=hidden_states_device, dtype=torch.bfloat16
-        )
-
-        deep_gemm_wrapper.grouped_gemm_nt_f4f4bf16_masked(
-            (hidden_states, hidden_states_scale),
-            (w13_weight, w13_scale),
-            b13,
-            gateup_output,
-            masked_m,
-            expected_m,
-        )
-        dispose_tensor(hidden_states)
-        dispose_tensor(hidden_states_scale)
 
         swiglu_limit_arg: Optional[float] = None
         if self.swiglu_limit is not None:
             swiglu_limit_arg = self.swiglu_limit
 
-        # Act
-        if self.config.activation == "situ":
+        fuse_epilogue = (
+            quant_info.w13_epilogue_fused
+            and self.config.activation == "silu"
+            and self.config.gemm1_alpha is None
+            and b13 is None
+        )
+        if fuse_epilogue:
+            assert n % 128 == 0, f"fused FP4 epilogue requires n % 128 == 0, got {n}"
             down_input = torch.empty(
                 (num_groups, m, n // 4),
                 device=hidden_states_device,
                 dtype=torch.uint8,
             )
             down_input_scale = torch.empty(
-                (num_groups, n // 128, m),
+                (num_groups, m, ceil_div(n // 4, 32)),
                 device=hidden_states_device,
                 dtype=torch.uint16,
             )
-            self._apply_situ_and_mul(
-                gateup_output,
+            deep_gemm_wrapper.grouped_gemm_nt_f4f4bf16_masked(
+                (hidden_states, hidden_states_scale),
+                (w13_weight, w13_scale),
+                b13,
                 down_input,
-                masked_m=masked_m,
-                down_input_scale=down_input_scale,
-                expected_m=expected_m,
+                masked_m,
+                expected_m,
+                out_scale=down_input_scale,
+                swiglu_limit=swiglu_limit_arg,
             )
+            dispose_tensor(hidden_states)
+            dispose_tensor(hidden_states_scale)
         else:
-            down_input, down_input_scale = silu_and_mul_masked_post_quant_mxfp4(
+            gateup_output = torch.empty(
+                (num_groups, m, n), device=hidden_states_device, dtype=torch.bfloat16
+            )
+
+            deep_gemm_wrapper.grouped_gemm_nt_f4f4bf16_masked(
+                (hidden_states, hidden_states_scale),
+                (w13_weight, w13_scale),
+                b13,
                 gateup_output,
                 masked_m,
-                swiglu_limit=swiglu_limit_arg,
-                expected_m=expected_m,
+                expected_m,
             )
-        del gateup_output
+            dispose_tensor(hidden_states)
+            dispose_tensor(hidden_states_scale)
+
+            # Act
+            if self.config.activation == "situ":
+                down_input = torch.empty(
+                    (num_groups, m, n // 4),
+                    device=hidden_states_device,
+                    dtype=torch.uint8,
+                )
+                down_input_scale = torch.empty(
+                    (num_groups, n // 128, m),
+                    device=hidden_states_device,
+                    dtype=torch.uint16,
+                )
+                self._apply_situ_and_mul(
+                    gateup_output,
+                    down_input,
+                    masked_m=masked_m,
+                    down_input_scale=down_input_scale,
+                    expected_m=expected_m,
+                )
+            else:
+                down_input, down_input_scale = silu_and_mul_masked_post_quant_mxfp4(
+                    gateup_output,
+                    masked_m,
+                    swiglu_limit=swiglu_limit_arg,
+                    expected_m=expected_m,
+                )
+            del gateup_output
 
         # GroupGemm-1
         n = w2_weight.shape[1]
@@ -2164,8 +2230,10 @@ class DeepGemmRunnerCore(MoeRunnerCore):
                 "max_block_n": max_block_n,
             }
 
-        # DeepGemm kernel expects [E, T, S//2] for mxfp4 scale
-        down_input_scale = down_input_scale.permute(0, 2, 1)
+        # Fused masked epilogue already emits [E, T, S//2]; unfused kernels
+        # emit [E, S//2, T] and must be permuted for GEMM2.
+        if not fuse_epilogue:
+            down_input_scale = down_input_scale.permute(0, 2, 1)
         deep_gemm_return_value = deep_gemm_wrapper.grouped_gemm_nt_f4f4bf16_masked(
             (down_input, down_input_scale),
             (w2_weight, w2_scale),

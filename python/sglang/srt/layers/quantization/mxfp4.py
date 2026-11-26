@@ -248,9 +248,15 @@ if _is_hip:
         dynamic_mxfp4_quant = e8m0_shuffle = err
 
 if is_sail():
+    preprocess_mxfp4_weight_for_act_and_quant_fusing = None
     try:
         # necessary call for mxfp4 deepgemm usage
         from deep_gemm import preprocess_mxfp4_scales
+
+        try:
+            from deep_gemm import preprocess_mxfp4_weight_for_act_and_quant_fusing
+        except ImportError:
+            pass
     except ImportError as e:
         from sglang.srt.utils import logger
 
@@ -1197,10 +1203,42 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                     layer.w2_weight_bias = Parameter(
                         w2_weight_bias, requires_grad=False
                     )
-                w13_scale = preprocess_mxfp4_scales(
-                    torch.stack(list(layer.w13_weight_scale), dim=0)
+                # Fuse SiLU+mul+MXFP4 post-quant into GEMM1 epilogue only when
+                # every active consumer expects the interleaved gate/up layout
+                # (DeepEP normal/low-latency with bias-free standard SiLU and
+                # N % 128 == 0; standard MoE-TP uses split-half quant kernels).
+                runner_cfg = getattr(layer, "moe_runner_config", None)
+                can_fuse_epilogue = (
+                    preprocess_mxfp4_weight_for_act_and_quant_fusing is not None
+                    and envs.SGLANG_OPT_DEEPGEMM_FP4_FUSE_MOE_EPILOGUE.get()
+                    and not self.with_bias
+                    and not get_moe_a2a_backend().is_none()
+                    and not get_moe_a2a_backend().is_megamoe()
+                    and runner_cfg is not None
+                    and runner_cfg.activation == "silu"
+                    and runner_cfg.gemm1_alpha is None
+                    and layer.w13_weight.shape[1] % 128 == 0
                 )
-                layer.w13_weight_scale = Parameter(w13_scale, requires_grad=False)
+                if can_fuse_epilogue:
+                    w13_weight_fused, w13_scale_fused = (
+                        preprocess_mxfp4_weight_for_act_and_quant_fusing(
+                            layer.w13_weight.data.contiguous(),
+                            torch.stack(
+                                list(layer.w13_weight_scale), dim=0
+                            ).contiguous(),
+                        )
+                    )
+                    layer.w13_weight = Parameter(w13_weight_fused, requires_grad=False)
+                    layer.w13_weight_scale = Parameter(
+                        w13_scale_fused, requires_grad=False
+                    )
+                    layer._deepgemm_fp4_fused_epilogue = True
+                else:
+                    w13_scale = preprocess_mxfp4_scales(
+                        torch.stack(list(layer.w13_weight_scale), dim=0)
+                    )
+                    layer.w13_weight_scale = Parameter(w13_scale, requires_grad=False)
+                    layer._deepgemm_fp4_fused_epilogue = False
                 w2_scale = preprocess_mxfp4_scales(
                     torch.stack(list(layer.w2_weight_scale), dim=0)
                 )
@@ -2214,6 +2252,9 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                     w13_scale=layer.w13_weight_scale,
                     w2_scale=layer.w2_weight_scale,
                     block_shape=[0, 16],
+                    w13_epilogue_fused=getattr(
+                        layer, "_deepgemm_fp4_fused_epilogue", False
+                    ),
                 )
             else:
                 # SM100+: FP8 activations + FP4 weights via DeepGEMM recipes.
@@ -2354,6 +2395,9 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 w13_scale=layer.w13_weight_scale,
                 w2_scale=layer.w2_weight_scale,
                 block_shape=[0, 16],
+                w13_epilogue_fused=getattr(
+                    layer, "_deepgemm_fp4_fused_epilogue", False
+                ),
             )
         elif backend.is_triton():
             quant_info = TritonMoeQuantInfo(

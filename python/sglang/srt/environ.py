@@ -1523,6 +1523,7 @@ class Envs:
     SGLANG_OPT_DEEPGEMM_MEGA_MOE_RESERVED_SMS = EnvInt(2)
     SGLANG_OPT_DEEPGEMM_MEGA_MOE_FUSE_SHARED_EXPERTS = EnvBool(True)
     SGLANG_OPT_DEEPGEMM_MEGA_GATE = EnvBool(False)
+    SGLANG_OPT_DEEPGEMM_FP4_FUSE_MOE_EPILOGUE = EnvBool(True)
 
     # ===================================================================
     # Top-k kernels

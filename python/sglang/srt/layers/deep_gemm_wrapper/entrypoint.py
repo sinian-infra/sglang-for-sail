@@ -663,6 +663,8 @@ def grouped_gemm_nt_f4f4bf16_masked(
     overlap_args: Optional[Any] = None,
     max_block_n: int = 256,
     configs=None,
+    out_scale: Optional[torch.Tensor] = None,
+    swiglu_limit: Optional[float] = None,
 ):
     assert _is_sail, f"only ppu deepgemm support grouped_gemm_nt_f4f4bf16_masked"
 
@@ -682,6 +684,18 @@ def grouped_gemm_nt_f4f4bf16_masked(
         )
     )
 
+    extra_kwargs: dict[str, Any] = {}
+    if overlap_args is not None:
+        extra_kwargs.update(
+            enable_sbo_overlap=True,
+            max_block_n=max_block_n,
+            signal=overlap_args.signal,
+        )
+    if out_scale is not None:
+        extra_kwargs["out_scale"] = out_scale
+        if swiglu_limit is not None:
+            extra_kwargs["swiglu_limit"] = swiglu_limit
+
     with compile_utils.deep_gemm_execution_hook(
         expected_m, n, k, num_groups, kernel_type
     ):
@@ -696,15 +710,7 @@ def grouped_gemm_nt_f4f4bf16_masked(
                 masked_m,
                 expected_m,
                 configs=best_config,
-                **(
-                    dict(
-                        enable_sbo_overlap=True,
-                        max_block_n=max_block_n,
-                        signal=overlap_args.signal,
-                    )
-                    if overlap_args is not None
-                    else {}
-                ),
+                **extra_kwargs,
             )
 
 
@@ -716,6 +722,8 @@ def grouped_gemm_nt_f4f4bf16_nopad(
     m_indices: torch.Tensor,
     m_rows: torch.Tensor = None,
     configs=None,
+    out_scale: Optional[torch.Tensor] = None,
+    swiglu_limit: Optional[float] = None,
 ):
     assert _is_sail, f"only ppu deepgemm support grouped_gemm_nt_f4f4bf16_nopad"
 
@@ -735,9 +743,15 @@ def grouped_gemm_nt_f4f4bf16_nopad(
         )
     )
 
+    epilogue_kwargs: dict[str, Any] = {}
+    if out_scale is not None:
+        epilogue_kwargs["out_scale"] = out_scale
+        if swiglu_limit is not None:
+            epilogue_kwargs["swiglu_limit"] = swiglu_limit
+
     with compile_utils.deep_gemm_execution_hook(m, n, k, num_groups, kernel_type):
         deep_gemm.m_grouped_gemm_fp4_fp4_bf16_nt_nopad(
-            lhs, rhs, bias, out, m_indices, m_rows, configs=best_config
+            lhs, rhs, bias, out, m_indices, m_rows, configs=best_config, **epilogue_kwargs
         )
 
 
