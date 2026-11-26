@@ -48,6 +48,12 @@ BASE = {
     "parser_checked",
     "sse_verified",
 }
+LIGHT_PERF_THROUGHPUT_METRICS = {
+    "prefill_throughput",
+    "median_decode_throughput",
+    "input_throughput",
+    "output_throughput",
+}
 
 
 def validate_legacy(payload):
@@ -264,8 +270,56 @@ def validate(payload):
             raise ValueError("passing nightly result did not meet gate")
 
 
+def write_light_perf_throughput(output, throughput):
+    output.write(
+        "| Case | Batch size | Input tokens | Output tokens | Metric | Throughput (token/s) |\n"
+        "| --- | ---: | ---: | ---: | --- | ---: |\n"
+    )
+    for name, result in sorted(throughput.items()):
+        for row in result["rows"]:
+            output.write(
+                f"| `{name}` | {row['batch_size']} | {row['input_len']} | "
+                f"{row['output_len']} | `{result['metric']}` | {row['tokens_per_s']:.2f} |\n"
+            )
+    output.write("\n")
+
+
+def validate_light_perf_throughput(throughput, case_status):
+    if (
+        type(throughput) is not dict
+        or not throughput
+        or throughput.keys() - case_status.keys()
+    ):
+        raise ValueError("invalid Light Perf throughput cases")
+    shape_fields = ("batch_size", "input_len", "output_len")
+    for result in throughput.values():
+        if (
+            type(result) is not dict
+            or set(result) != {"metric", "rows"}
+            or result["metric"] not in LIGHT_PERF_THROUGHPUT_METRICS
+            or type(result["rows"]) is not list
+            or not result["rows"]
+        ):
+            raise ValueError("invalid Light Perf throughput metric")
+        for row in result["rows"]:
+            if (
+                type(row) is not dict
+                or set(row) != {*shape_fields, "tokens_per_s"}
+                or any(type(row[key]) is not int or row[key] <= 0 for key in shape_fields)
+                or type(row["tokens_per_s"]) not in (int, float)
+                or not 0 <= row["tokens_per_s"] < math.inf
+            ):
+                raise ValueError("invalid Light Perf throughput measurement")
+
+
 def publish(payload, artifact, summary, console):
+    payload = payload.copy()
+    throughput = (
+        payload.pop("throughput", None) if payload.get("tier") == "light_perf" else None
+    )
     validate(payload)
+    if throughput is not None:
+        validate_light_perf_throughput(throughput, payload.get("case_status", {}))
     canonical = json.dumps(payload, sort_keys=True, allow_nan=False)
     artifact.parent.mkdir(parents=True, exist_ok=True)
     with artifact.open("x", encoding="utf-8") as output:
@@ -280,7 +334,10 @@ def publish(payload, artifact, summary, console):
             title = "PPU Light Performance"
         elif payload.get("tier") == "unit_test":
             title = "PPU Unit Tests"
-        output.write(f"## {title}\n\n```json\n" + canonical + "\n```\n")
+        output.write(f"## {title}\n\n")
+        if throughput is not None:
+            write_light_perf_throughput(output, throughput)
+        output.write("```json\n" + canonical + "\n```\n")
     print(canonical, file=console)
 
 

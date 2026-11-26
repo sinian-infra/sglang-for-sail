@@ -93,7 +93,21 @@ class TestLightPerf(unittest.TestCase):
                 "total_output_tokens": 64 * 1536,
             }
             output.write_text(json.dumps(row) + "\n")
-            self.assertTrue(check_one_batch_results(output, case, engine="one_batch_server"))
+            passed, measurements = check_one_batch_results(
+                output, case, engine="one_batch_server"
+            )
+            self.assertTrue(passed)
+            self.assertEqual(
+                measurements,
+                [
+                    {
+                        "batch_size": 64,
+                        "input_len": 4096,
+                        "output_len": 1536,
+                        "tokens_per_s": 10,
+                    }
+                ],
+            )
             row["total_output_tokens"] -= 1
             output.write_text(json.dumps(row) + "\n")
             with self.assertRaisesRegex(ValueError, "did not generate"):
@@ -175,7 +189,7 @@ class TestLightPerf(unittest.TestCase):
             ["0", "1"],
         )
 
-    def test_report_retains_measurements_but_only_publishes_case_status(self):
+    def test_report_renders_throughput_in_job_summary(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory).resolve()
             source = root / "scratch"
@@ -189,11 +203,24 @@ class TestLightPerf(unittest.TestCase):
             }))
             case_id = "qwen3_8_27b_bf16_tp2_prefill"
             relative = f"one-batch-fixture/{case_id}.jsonl"
-            measurements.joinpath(f"{case_id}.jsonl").write_text("{}\n")
+            row = {
+                "batch_size": 1,
+                "input_len": 4096,
+                "output_len": 1,
+                "tokens_per_s": 10229.67,
+            }
+            throughput = {"metric": "prefill_throughput", "rows": [row]}
+            measurements.joinpath(f"{case_id}.jsonl").write_text(
+                json.dumps({**row, "private_detail": "/private/benchmark"}) + "\n"
+            )
             source.joinpath("results/summary.json").write_text(json.dumps({
                 "outcome": "pass",
                 "queue_s": 0,
-                "cases": {case_id: {"passed": True, "results": relative}},
+                "cases": {case_id: {
+                    "passed": True,
+                    "results": relative,
+                    "throughput": throughput,
+                }},
             }))
             public = root / "public.json"
             with (
@@ -214,13 +241,40 @@ class TestLightPerf(unittest.TestCase):
             ):
                 self.assertEqual(report_recipe(), 0)
             payload = json.loads(public.read_text())
-            validate(payload)
             self.assertEqual(payload["case_status"], {case_id: True})
             self.assertNotIn(relative, public.read_text())
+            artifact = root / "artifact.json"
+            summary = root / "job-summary.md"
+            console = io.StringIO()
+            publish(payload, artifact, summary, console)
+            evidence = json.loads(artifact.read_text())
+            validate(evidence)
+            self.assertNotIn("throughput", evidence)
+            self.assertEqual(json.loads(console.getvalue()), evidence)
+            self.assertIn(
+                f"| `{case_id}` | 1 | 4096 | 1 | `prefill_throughput` | 10229.67 |",
+                summary.read_text(),
+            )
+            self.assertNotIn("/private/benchmark", summary.read_text())
+            with self.assertRaisesRegex(ValueError, "invalid Light Perf throughput measurement"):
+                publish(
+                    {
+                        **payload,
+                        "throughput": {
+                            case_id: {
+                                **throughput,
+                                "rows": [{**row, "tokens_per_s": "invalid"}],
+                            }
+                        },
+                    },
+                    artifact,
+                    summary,
+                    console,
+                )
             retained = root / "archive/sglang/logs/sglang-for-sail/12345-1/light_perf"
             self.assertTrue((retained / "qwen3.8-27b/results" / relative).is_file())
             with self.assertRaisesRegex(ValueError, "lacks evidence"):
-                validate({**payload, "case_status": {case_id: False}})
+                validate({**evidence, "case_status": {case_id: False}})
 
     def test_qwen_tp2_recipe_to_benchmark_results(self):
         policy = DEFAULT_POLICY_ROOT / "models/qwen3.8-27b.yaml"
@@ -290,6 +344,20 @@ class TestLightPerf(unittest.TestCase):
                     summary = run_light_perf(policy, assets, 0)
                 self.assertEqual(launch.call_count, 2)
                 self.assertEqual(summary["outcome"], outcome)
+                self.assertEqual(
+                    [
+                        (result["throughput"]["metric"], len(result["throughput"]["rows"]))
+                        for result in summary["cases"].values()
+                    ],
+                    [("prefill_throughput", 4), ("median_decode_throughput", 1)],
+                )
+                for result in summary["cases"].values():
+                    self.assertTrue(
+                        all(
+                            row["tokens_per_s"] == throughput
+                            for row in result["throughput"]["rows"]
+                        )
+                    )
 
             with (
                 patch.dict(os.environ, {"RECIPE_PPU_COUNT": "1"}),

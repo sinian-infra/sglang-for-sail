@@ -79,8 +79,9 @@ also runs the pilot once its entry file is available on the default branch.
 Both entries use the PPU manual dispatch approval, build the candidate wheel,
 and schedule the allocation for each selected policy. Each Pod uses the existing offline Hugging Face
 cache for the model configuration and tokenizer.
-The job summary shows which cases passed. Benchmark logs and JSONL measurements
-are retained in the private results directory under the `light_perf` tier.
+The job summary shows case status and measured throughput for each input shape.
+Benchmark logs and JSONL measurements are retained in the private results
+directory under the `light_perf` tier.
 
 To dispatch the same workload from the CLI, use the branch containing the pilot:
 
