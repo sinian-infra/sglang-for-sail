@@ -38,7 +38,9 @@ from sglang.srt.runtime_context import (
     get_spec,
     get_stream,
 )
-from sglang.srt.utils import get_bool_env_var, is_cpu, is_hip, is_xpu
+from sglang.srt.utils import get_bool_env_var, is_cpu, is_hip, is_sail, is_xpu
+
+_is_sail = is_sail()
 
 if is_xpu():
     # custom_all_reduce_v2 imports tvm_ffi, absent on XPU; isinstance(x, ()) is False.
@@ -1283,7 +1285,15 @@ def dp_reduce_scatterv_async(
 
 
 def attn_tp_reduce_scatter_tensor(output: torch.Tensor, input: torch.Tensor):
-    return get_parallel().attn_tp_group.reduce_scatter_tensor(output, input)
+    group = get_parallel().attn_tp_group
+    if _is_sail and envs.SGLANG_OPT_SAIL_IPC_COLLECTIVES.get():
+        from sglang.srt.hardware_backend.ppu.sail_ipc_collectives import (
+            get_sail_ipc_collective_manager,
+        )
+
+        if get_sail_ipc_collective_manager().try_reduce_scatter(group, output, input):
+            return
+    return group.reduce_scatter_tensor(output, input)
 
 
 def attn_cp_reduce_scatter_tensor(output: torch.Tensor, input: torch.Tensor):
@@ -1295,7 +1305,15 @@ def attn_tp_all_reduce(input: torch.Tensor):
 
 
 def attn_tp_all_gather_into_tensor(output: torch.Tensor, input: torch.Tensor):
-    return get_parallel().attn_tp_group.all_gather_into_tensor(output, input)
+    group = get_parallel().attn_tp_group
+    if _is_sail and envs.SGLANG_OPT_SAIL_IPC_COLLECTIVES.get():
+        from sglang.srt.hardware_backend.ppu.sail_ipc_collectives import (
+            get_sail_ipc_collective_manager,
+        )
+
+        if get_sail_ipc_collective_manager().try_all_gather(group, output, input):
+            return
+    return group.all_gather_into_tensor(output, input)
 
 
 def attn_cp_all_gather_into_tensor(output: torch.Tensor, input: torch.Tensor):

@@ -1591,6 +1591,9 @@ class Envs:
     # See docs/references/environment_variables.
     SGLANG_ENABLE_PCIE_IPC_ALLREDUCE = EnvBool(False)
     SGLANG_PCIE_IPC_MAX_NUMEL = EnvInt(0)
+    # Lock-free symmetric IPC AllGather / ReduceScatter fast path for small/medium
+    # TP4/TP8 decode batches on Sail/PPU.
+    SGLANG_OPT_SAIL_IPC_COLLECTIVES = EnvBool(True)
 
     # ===================================================================
     # RoPE cache
