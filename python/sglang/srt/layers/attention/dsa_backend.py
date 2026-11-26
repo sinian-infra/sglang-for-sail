@@ -2980,7 +2980,9 @@ class DeepseekSparseAttnBackend(
 
         if dsa_impl == "flashmla_sparse":
             if q_rope is not None:
-                q_all = concat_mla_absorb_q_general(q_nope, q_rope)
+                q_all = _adjacent_absorbed_q(q_nope, q_rope)
+                if q_all is None:
+                    q_all = concat_mla_absorb_q_general(q_nope, q_rope)
             return self._forward_flashmla_sparse(
                 q_all=q_all,
                 kv_cache=kv_cache,
@@ -3170,7 +3172,25 @@ class DeepseekSparseAttnBackend(
                 (num_heads + required_padding - 1) // required_padding
             ) * required_padding
 
-        need_padding = num_heads % required_padding != 0
+        # Sail FlashMLA natively supports small head counts (H=8/16 under
+        # TP8/TP4, e.g. GLM-5.3) for BF16 sparse MLA (d_qk=576, d_v=512)
+        # without padding Q and output up to 64 heads. Measured on ZW-M890P,
+        # H<=16 delivers a consistent 1.12x-1.17x speedup across B=4..64 while
+        # avoiding the H=32 small-batch regression.
+        sail_native_small_heads = (
+            _is_sail
+            and envs.SGLANG_OPT_SAIL_FLASHMLA_SMALL_HEADS.get()
+            and num_heads in (8, 16)
+            and head_dim == 576
+            and v_head_dim == 512
+            and q_all.dtype == torch.bfloat16
+            and kv_cache.dtype == torch.bfloat16
+            and q_all.is_contiguous()
+            and kv_cache.stride(-1) == 1
+        )
+        need_padding = (
+            num_heads % required_padding != 0 and not sail_native_small_heads
+        )
 
         if need_padding:
             assert required_padding % num_heads == 0 or (
